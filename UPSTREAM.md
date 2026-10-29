@@ -27,3 +27,15 @@ tree; there are no `.patch` files to apply and no hunk arithmetic to get wrong.
 
 Build: open `extension/windbgmcpExt.sln` (VS 2022, Release|x64), or let
 `tools/debugger-lab/edge_build.ps1` in OSEE do it.
+
+## Licence / attribution
+
+Upstream is **MIT** (Copyright (c) 2025 Nadav Lorber). MIT requires the
+original copyright notice to be preserved, so `LICENSE` keeps that line
+verbatim and the fork's own notice is **appended** underneath:
+
+    Copyright (c) 2025 Nadav Lorber
+    Copyright (c) 2026 esp0xdeadbeef (fork: OSEE modifications)
+
+That is the conventional shape for a fork: never edit or replace the upstream
+holder's line, just add yours. The same terms cover the tree as a whole.
