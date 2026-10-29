@@ -38,6 +38,65 @@ HANDLE g_shutdownEvent = nullptr;
  * @param flags Pointer to flags to be set.
  * @return HRESULT indicating success or failure.
  */
+#include <cstdio>  // _snprintf_s
+
+// --- per-instance pipe name resolution (OSEE multi-instance patch) ---
+// Priority: WINDBGMCP_PIPE env var > "\\.\pipe\windbgmcp.<pid>".
+static std::string ResolveMcpPipeName() {
+	char buf[512] = {0};
+	DWORD n = GetEnvironmentVariableA("WINDBGMCP_PIPE", buf, sizeof(buf));
+	if (n > 0 && n < sizeof(buf)) {
+		std::string want(buf, n);
+		// Callers pass a BARE name ("windbgmcp.kdbg.AWE_03"). CreateNamedPipeA
+		// needs the object-manager path, and without the prefix it fails with
+		// error 123 ERROR_INVALID_NAME, so the pipe is never created even though
+		// the extension prints "MCP server started on pipe: ...".
+		if (want.rfind("\\", 0) != 0 && want.rfind("//", 0) != 0) {
+			if (want.rfind("pipe\\", 0) == 0) want = "\\\\.\\" + want;
+			else                                want = "\\\\.\\pipe\\" + want;
+		}
+		return want;
+	}
+	char name[160];
+	_snprintf_s(name, sizeof(name), _TRUNCATE,
+	            "\\\\.\\pipe\\windbgmcp.%lu", (unsigned long)GetCurrentProcessId());
+	return std::string(name);
+}
+
+// Record the pipe name to a file so the Python bridge can discover it
+// deterministically (named-pipe enumeration via Python is unreliable).
+static void WriteMcpPipeRecord(const std::string& pipeName) {
+	// 1) WinDbgX package LocalState (writable by the WinDbgX AppContainer)
+	char base[MAX_PATH] = {0};
+	DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof(base));
+	if (n > 0 && n < sizeof(base)) {
+		char dir[MAX_PATH];
+		_snprintf_s(dir, sizeof(dir), _TRUNCATE,
+		            "%s\\Packages\\Microsoft.WinDbg_8wekyb3d8bbwe\\LocalState", base);
+		CreateDirectoryA(dir, nullptr);
+		char path[MAX_PATH];
+		_snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\mcp.%lu.pipe",
+		            dir, (unsigned long)GetCurrentProcessId());
+		HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (h != INVALID_HANDLE_VALUE) {
+			DWORD w = 0; DWORD m = (DWORD)pipeName.size();
+			WriteFile(h, pipeName.c_str(), m, &w, nullptr);
+			CloseHandle(h);
+		}
+	}
+	// 2) C:\ProgramData\wbmcp (also writable by the Edge-renderer AppContainer)
+	CreateDirectoryA("C:\\ProgramData\\wbmcp", nullptr);
+	char ppath[MAX_PATH];
+	_snprintf_s(ppath, sizeof(ppath), _TRUNCATE,
+	            "C:\\ProgramData\\wbmcp\\mcp.%lu.pipe", (unsigned long)GetCurrentProcessId());
+	HANDLE h2 = CreateFileA(ppath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h2 != INVALID_HANDLE_VALUE) {
+		DWORD w = 0; DWORD m = (DWORD)pipeName.size();
+		WriteFile(h2, pipeName.c_str(), m, &w, nullptr);
+		CloseHandle(h2);
+	}
+}
+
 HRESULT __stdcall DebugExtensionInitialize(PULONG version, PULONG flags) {
 	if (!version || !flags) {
 		return E_POINTER;
@@ -71,10 +130,12 @@ HRESULT __stdcall DebugExtensionInitialize(PULONG version, PULONG flags) {
 	CommandHandlers::RegisterHandlers(*g_mcpServer);
 	
 	// Start the server
-	if (!g_mcpServer->Start()) {
+	std::string pipeName = ResolveMcpPipeName();
+	if (!g_mcpServer->Start(pipeName)) {
 		dprintf("Failed to start MCP server\n");
 	} else {
-		dprintf("MCP server started on pipe: %s\n", Constants::DEFAULT_PIPE_NAME);
+		dprintf("MCP server started on pipe: %s\n", pipeName.c_str());
+		WriteMcpPipeRecord(pipeName);
 	}
 
 	return S_OK;
@@ -168,12 +229,15 @@ STDAPI mcpstart(IDebugClient* client, PCSTR args) {
 		return S_OK;
 	}
 	
-	if (!g_mcpServer->Start()) {
+	std::string pipeName = ResolveMcpPipeName();
+	if (args && *args) { const char* a = args; while (*a == ' ') ++a; if (*a) pipeName = std::string(a); }
+	if (!g_mcpServer->Start(pipeName)) {
 		dprintf("Failed to start MCP server\n");
 		return E_FAIL;
 	}
 	
-	dprintf("MCP server started on pipe: %s\n", Constants::DEFAULT_PIPE_NAME);
+	dprintf("MCP server started on pipe: %s\n", pipeName.c_str());
+	WriteMcpPipeRecord(pipeName);
 	return S_OK;
 }
 

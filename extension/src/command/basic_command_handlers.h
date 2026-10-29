@@ -41,6 +41,7 @@ public:
      * @return JSON response with connection status.
      */
     static json CheckConnectionHandler(const json& message);
+    static json InterruptHandler(const json& message);
     
     /**
      * @brief Get WinDbg version information.

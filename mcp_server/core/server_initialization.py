@@ -89,12 +89,33 @@ class ServerInitializer:
             )
         
         try:
-            # Test extension connection
-            extension_connected = test_connection()
-            
-            # Always test target connection regardless of extension status
-            # The target connection works independently via direct WinDbg commands
-            target_connected, target_status = test_target_connection()
+            # BOUNDED, NON-FATAL.
+            #
+            # These probes talk to the extension pipe. If a WinDbgX session is
+            # halted at a breakpoint, or the pipe is busy, the probe can block
+            # for a very long time -- and because this runs BEFORE the HTTP
+            # server binds, the bridge never comes up at all. Symptom: the
+            # supervisor logs "no bridge answering", restarts the child, the child
+            # hangs in this same probe, forever; `python -m mcp_server.server` is
+            # alive but never listens on :8001.
+            #
+            # A session being wedged is NOT a reason to refuse to serve: /list and
+            # every per-call `instance=` pin still work, and that is precisely when
+            # you need the bridge most.
+            def _bounded(fn, *a, **k):
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+                    return ex.submit(fn, *a, **k).result(timeout=5)
+            try:
+                extension_connected = _bounded(test_connection)
+            except Exception as _e:
+                logger.warning("extension probe skipped/timed out: %s", _e)
+                extension_connected = False
+            try:
+                target_connected, target_status = _bounded(test_target_connection)
+            except Exception as _e:
+                logger.warning("target probe skipped/timed out: %s", _e)
+                target_connected, target_status = False, "probe timed out"
             
             # Log results
             if extension_connected:
@@ -169,12 +190,14 @@ class ServerInitializer:
             return "unknown"
         
         # Detect mode from target status
-        if "kernel" in target_status.lower():
-            return "kernel"
-        elif "user" in target_status.lower():
+        ts = target_status.lower()
+        if "user" in ts:
             return "user"
+        elif "kernel" in ts:
+            return "kernel"
         else:
-            return "kernel"  # Default assumption for Windows debugging
+            # For an attached browser renderer this is user-mode; don't assume kernel.
+            return "user"
     
     def _log_connection_summary(self, connection_result: ConnectionTestResult):
         """Log a summary of connection status."""

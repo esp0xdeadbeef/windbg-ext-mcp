@@ -149,6 +149,17 @@ def is_safe_for_automation(command: str) -> bool:
     if base_command in DANGEROUS_COMMANDS:
         return False
     
+    # EXPLICIT session-quit is allowed; the bare word is not.
+    #
+    # A lone "q" stays dangerous -- it is one keystroke away from killing a
+    # session someone else is inspecting. But "quit-session" is an EXPLICIT,
+    # self-describing request, and the driver needs it: killing a WinDbgX with
+    # Stop-Process instead leaves its pipe record in C:\ProgramData\wbmcp, and the
+    # next launch finds a name that exists but never answers (reads as a wedged
+    # bridge). So the deliberate form is permitted, the accidental one is not.
+    if base_command.lower() in {"quit-session", "quitsession"}:
+        return True
+
     # CHANGED: Now allow execution control commands for LLM automation
     # These are essential for interactive debugging workflows
     execution_commands = {"g", "p", "t", "gu", "wt"}

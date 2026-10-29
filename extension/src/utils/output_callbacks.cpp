@@ -56,6 +56,10 @@ STDMETHODIMP OutputCallbacks::Output(
     
     const std::string textStr(Text);
 
+    // Serialise against GetOutput()/Clear(): this runs on dbgeng's callback
+    // thread while those run on the MCP command thread.
+    std::lock_guard<std::mutex> lock(m_outputMutex);
+
     // Check for various types of messages
     if (textStr.find("WARNING: .cache forcedecodeuser is not enabled") != std::string::npos) {
         // This is a common warning, not a fatal error - log but continue
@@ -102,6 +106,8 @@ STDMETHODIMP OutputCallbacks::Output(
 }
 
 std::string OutputCallbacks::GetOutput() const {
+    // Take the lock: dbgeng may still be appending from its callback thread.
+    std::lock_guard<std::mutex> lock(m_outputMutex);
     // If the output exceeds a reasonable size, truncate it and add a note
     if (m_output.size() > MAX_OUTPUT_SIZE) {
         std::string truncated = m_output.substr(0, MAX_OUTPUT_SIZE);
@@ -113,6 +119,7 @@ std::string OutputCallbacks::GetOutput() const {
 }
 
 void OutputCallbacks::Clear() {
+    std::lock_guard<std::mutex> lock(m_outputMutex);
     m_output.clear();
     m_extensionError = false;
     m_exportError = false;

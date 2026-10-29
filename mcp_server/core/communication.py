@@ -19,7 +19,7 @@ import win32api
 import win32event
 import pywintypes
 
-from config import PIPE_NAME, BUFFER_SIZE, DEFAULT_TIMEOUT_MS, DebuggingMode, get_timeout_for_command
+from config import PIPE_NAME, PIPE_NAMES, BUFFER_SIZE, DEFAULT_TIMEOUT_MS, DebuggingMode, get_timeout_for_command
 
 logger = logging.getLogger(__name__)
 
@@ -200,9 +200,15 @@ class MessageProtocol:
     """Handles message-level protocol for MCP communication."""
     
     @staticmethod
-    def create_command_message(command: str, timeout_ms: int) -> Dict[str, Any]:
-        """Create a command message for the WinDbg extension."""
-        return {
+    def create_command_message(command: str, timeout_ms: int, quiet: bool = False) -> Dict[str, Any]:
+        """Create a command message for the WinDbg extension.
+
+        quiet=True marks an INTERNAL probe (health check, mode detection, etc.)
+        whose output must not be mirrored to the WinDbgX console. The extension
+        will run it with DEBUG_OUTCTL_THIS_CLIENT so the human never sees the
+        banner/list noise, while explicit user commands still appear.
+        """
+        msg = {
             "type": "command",
             "command": "execute_command",
             "id": int(time.time() * 1000),
@@ -211,6 +217,9 @@ class MessageProtocol:
                 "timeout_ms": timeout_ms
             }
         }
+        if quiet:
+            msg["args"]["quiet"] = True
+        return msg
     
     @staticmethod
     def create_handler_message(handler_name: str, **kwargs) -> Dict[str, Any]:
@@ -412,12 +421,29 @@ class CommunicationManager:
         )
         self._health_lock = threading.Lock()
         self._connection_pool = ConnectionPool()
+
+    # --- multi-instance support (OSEE patch) --------------------------------
+    def set_instance(self, pipe_name: str) -> None:
+        """Select which WinDbgX instance (named pipe) commands go to."""
+        self._connection_pool._pipe_name = pipe_name
+        logger.info(f"WinDbg instance set to {pipe_name}")
+
+    def get_instance(self) -> str:
+        return self._connection_pool._pipe_name
+
+    @property
+    def _pipe_name(self) -> str:
+        return self._connection_pool._pipe_name
+
+    @_pipe_name.setter
+    def _pipe_name(self, value: str) -> None:
+        self._connection_pool._pipe_name = value
     
-    def send_command(self, command: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> str:
+    def send_command(self, command: str, timeout_ms: int = DEFAULT_TIMEOUT_MS, quiet: bool = False) -> str:
         """Send a command to the WinDbg extension."""
         logger.debug(f"Sending command: {command}")
         
-        message = MessageProtocol.create_command_message(command, timeout_ms)
+        message = MessageProtocol.create_command_message(command, timeout_ms, quiet)
         
         try:
             response = self._send_message(message, timeout_ms)
@@ -474,8 +500,14 @@ class CommunicationManager:
     def test_connection(self) -> bool:
         """Test if the connection to the WinDbg extension is working."""
         try:
-            result = self.send_handler_command("version", timeout_ms=get_timeout_for_command("version"))
-            extension_responsive = bool(result.get("status") == "success")
+            # Probe with .lastevent instead of the "version" HANDLER: version
+            # runs dbgeng's `version`, which prints the entire startup banner
+            # (Windows version, Product, Edition build lab, session/uptime,
+            # copyright, EngHost command line, dbgeng/dbghelp paths, DIA
+            # version, extension search path and DLL chain). That ran on every
+            # health check, i.e. before every command.
+            result = self.send_command(".lastevent", timeout_ms=get_timeout_for_command("version"), quiet=True)
+            extension_responsive = bool(result and not result.startswith("Error:"))
             
             with self._health_lock:
                 self._connection_health.extension_responsive = extension_responsive
@@ -510,16 +542,24 @@ class CommunicationManager:
     def test_target_connection(self) -> Tuple[bool, str]:
         """Test if the debugging target is responsive."""
         try:
-            result = self.send_command("version", timeout_ms=get_timeout_for_command("version"))
+            # .lastevent answers with one line and still proves the target is
+            # responsive; `version` re-emitted the whole startup banner.
+            result = self.send_command(".lastevent", timeout_ms=get_timeout_for_command("version"), quiet=True)
             target_responsive = bool(result and not result.startswith("Error:"))
             
             with self._health_lock:
                 self._connection_health.target_responsive = target_responsive
             
             if target_responsive:
-                if "kernel" in result.lower():
+                low = result.lower()
+                # Prefer explicit user-mode markers: the WinDbg `version` banner
+                # prints "Live user mode: <Local>" for a user-mode attach, but may
+                # also mention "kernel" elsewhere, so check user mode FIRST.
+                if "user mode" in low or "live user mode" in low:
+                    return True, "User-mode debugging target connected"
+                elif "kernel" in low:
                     return True, "Kernel debugging target connected"
-                elif "user" in result.lower() or "process" in result.lower():
+                elif "process" in low:
                     return True, "User-mode debugging target connected"
                 else:
                     return True, "Debugging target connected"
@@ -599,7 +639,7 @@ class CommunicationManager:
             handle = None
             try:
                 message_bytes = MessageProtocol.serialize_message(message)
-                handle = NamedPipeProtocol.connect_to_pipe(PIPE_NAME, timeout_ms)
+                handle = NamedPipeProtocol.connect_to_pipe(self._pipe_name, timeout_ms)
                 
                 NamedPipeProtocol.write_to_pipe(handle, message_bytes, timeout_ms)
                 response_data = NamedPipeProtocol.read_from_pipe(handle, timeout_ms)
@@ -631,27 +671,363 @@ class CommunicationManager:
                 self._connection_health.extension_responsive = False
 
 
-# Global Communication Manager Instance
-_communication_manager: Optional[CommunicationManager] = None
-_manager_lock = threading.Lock()
+# Global Communication Manager Instance (per-instance registry, OSEE patch)
+_communication_managers: Dict[str, CommunicationManager] = {}
+_current_instance: Optional[str] = None
+# Thread-local selected instance so concurrent MCP calls don't clobber each
+# other (each request can pick its own WinDbgX session).
+_thread_local = threading.local()
 
-def _get_communication_manager() -> CommunicationManager:
-    """Get the global communication manager instance."""
-    global _communication_manager
+# Per-MCP-client pin: {client_id -> pipe_name}. Two agents share one bridge, and
+# requests for the same client may be served on different threads, so a
+# thread-local alone is not enough to keep their selections apart.
+_client_pins: Dict[str, str] = {}
+_client_pins_lock = threading.Lock()
+
+# RLock (not Lock): helpers nest (_selected_instance -> _discover_pipes,
+# set_windbg_instance -> _get_communication_manager). Nesting is avoided
+# where known, but RLock means a missed one degrades to reentrancy instead
+# of deadlocking the entire bridge.
+_manager_lock = threading.RLock()
+
+
+def select_client_instance(client_id: Optional[str], pipe_name: str) -> str:
+    """Pin a whole MCP client session to one WinDbgX pipe."""
+    if not client_id:
+        return pipe_name
+    with _client_pins_lock:
+        if pipe_name:
+            _client_pins[client_id] = pipe_name
+        else:
+            _client_pins.pop(client_id, None)
+    return pipe_name
+
+
+def client_instance(client_id: Optional[str]) -> Optional[str]:
+    if not client_id:
+        return None
+    with _client_pins_lock:
+        return _client_pins.get(client_id)
+
+
+def select_thread_instance(pipe_name: Optional[str]) -> None:
+    """Bind the CURRENT THREAD (one MCP request) to a specific instance.
+
+    run_command() calls this per request; the client pin above is the durable
+    per-agent selection, this is the per-request override.
+    """
+    _thread_local.instance = pipe_name if pipe_name else None
+
+
+def _make_manager(pipe_name: str) -> CommunicationManager:
+    m = CommunicationManager()
+    m.set_instance(pipe_name)
+    return m
+
+
+def _get_communication_manager(instance: Optional[str] = None) -> CommunicationManager:
+    """Return the CommunicationManager for a given pipe (one per instance).
+
+    With no argument, use the CURRENTLY SELECTED instance (default = the first
+    configured pipe). This keeps every WinDbgX session independent so they can
+    be driven concurrently.
+    """
+    global _current_instance
     with _manager_lock:
-        if _communication_manager is None:
-            _communication_manager = CommunicationManager()
-        return _communication_manager
+        name = instance or _selected_instance()
+        m = _communication_managers.get(name)
+        if m is None:
+            m = _make_manager(name)
+            _communication_managers[name] = m
+        return m
+
+
+def _selected_instance() -> str:
+    """Instance for this call.
+
+    Precedence: this thread's pin (run_command sets it per request) > this MCP
+    client's pin (select_instance, survives across requests) > _current_instance
+    (explicitly selected default).
+
+    There is deliberately NO fallback from a named-but-dead instance to another
+    live one, and NO implicit pick when nothing is selected: see the two
+    RuntimeErrors below.
+    """
+    want = (getattr(_thread_local, "instance", None)
+            or client_instance(getattr(_thread_local, "client_id", None))
+            or _current_instance)
+    live = _discover_pipes()
+    if want and (not live or want in live):
+        return want
+    # NO SILENT FALLBACK to "some live pipe". Choosing a different session than
+    # the caller named is how commands landed in another agent's debugger: the
+    # caller believes it is driving its own target while it drives theirs, and
+    # because the wrong session answers successfully the mistake is invisible.
+    if want:
+        raise RuntimeError(
+            "instance %r is not live (live: %s). Name a live instance with "
+            "instance=...; refusing to fall back to a different session."
+            % (want, live))
+    # NOTHING SELECTED. Picking live[0] here used to return whatever sorted
+    # first -- with four kernel kdbg.* sessions and one userland session live,
+    # `current` became kdbg.AWE_EM_01 and unpinned calls silently drove a
+    # KERNEL debugger while the caller believed it was on its own userland
+    # target (measured: `kb` answered nt!DbgBreakPointWithStatus/kdnic for a
+    # request meant for php.exe). The wrong session answering successfully is
+    # exactly what makes this invisible, so refuse instead of guessing.
+    if len(live) > 1:
+        raise RuntimeError(
+            "no instance selected and %d are live (%s). Pin one with "
+            "instance=.../select_instance, or set MCP_INSTANCE; refusing to guess."
+            % (len(live), ", ".join(live)))
+    if live:
+        return live[0]
+    return PIPE_NAMES[0] if PIPE_NAMES else PIPE_NAME
+
+
+# --- multi-instance support (OSEE patch) ------------------------------------
+def _discover_pipes() -> list:
+    r"""Enumerate LIVE WinDbgX pipes by scanning the named-pipe namespace.
+
+    The extension creates \\.\pipe\windbgmcp.<pid> when `.load`ed into a
+    WinDbgX, and the pipe disappears when that WinDbgX exits. Scanning here
+    means:
+      * a session started AFTER the bridge came up is picked up automatically
+      * a session that closed simply stops appearing (no stale entries)
+    WINDBGMCP_PIPES, if set, is still honoured but only as an ADDITIONAL static
+    list (useful when the bridge runs on another host / cannot see the pipes).
+    """
+    found = []
+    try:
+        import os as _os
+        d = r"\\.\pipe"
+        for name in _os.listdir(d):
+            # Accept BOTH the per-session form (windbgmcp.<pid>) and the
+            # bare default (windbgmcp). ResolveMcpPipeName() normally yields the
+            # former, but if WINDBGMCP_PIPE is set, or the extension falls back
+            # to Constants::DEFAULT_PIPE_NAME, the pipe is called plain
+            # "windbgmcp" -- and a `startswith("windbgmcp.")` test then matched
+            # nothing, so /list reported count:0 while the extension was in fact
+            # loaded and serving. That reads exactly like "the MCP is dead".
+            if name == "windbgmcp" or name.startswith("windbgmcp."):
+                found.append(r"\\.\pipe" + "\\" + name)
+    except Exception:
+        pass
+    # static fallback / additions
+    for p in PIPE_NAMES:
+        if p not in found:
+            # only add a static pipe if it actually exists
+            try:
+                import os as _os
+                leaf = p.rsplit("\\", 1)[-1]
+                if leaf in _os.listdir(r"\\.\pipe"):
+                    found.append(p)
+            except Exception:
+                pass
+    # stable order: by pid ascending
+    def _pid(p):
+        try:
+            return int(p.rsplit(".", 1)[-1])
+        except Exception:
+            return 0
+    return sorted(found, key=_pid)
+
+
+def _prune_dead_managers(live: list) -> None:
+    """Drop managers whose pipe no longer exists (WinDbgX closed)."""
+    with _manager_lock:
+        for name in list(_communication_managers.keys()):
+            if name not in live:
+                _communication_managers.pop(name, None)
+
+
+def list_windbg_instances() -> list:
+    """Return the LIVE WinDbgX pipe names, refreshing on every call.
+
+    Deliberately does NOT prune here: pruning takes _manager_lock, and /list must
+    stay answerable even while another agent's pipe I/O is in flight. Pruning to
+    one side also avoids a discovery-vs-lock cycle.
+    """
+    return _discover_pipes()
+
+
+def set_windbg_instance(pipe_name: str, client_id: Optional[str] = None) -> str:
+    """Pin an MCP client session (and this thread) to one WinDbgX instance.
+
+    Two agents share one bridge, so selection must be per-client, not a
+    process-wide global -- otherwise agent B's select_instance silently redirects
+    agent A's commands (observed: both agents got the same session's output).
+
+    `_current_instance` is still updated as the default for brand-new clients
+    that never call select_instance.
+    """
+    global _current_instance
+    name = (pipe_name or "").strip()
+    if not name:
+        return get_windbg_instance()
+    select_thread_instance(name)                 # this thread
+    if client_id:
+        select_client_instance(client_id, name)  # this MCP client session
+    with _manager_lock:
+        _current_instance = name                 # default for un-pinned clients
+    # Do NOT call _get_communication_manager() while holding _manager_lock: that
+    # helper takes the SAME lock, so nesting self-deadlocks the request and wedges
+    # the whole bridge (every later tool call hangs). Hoisted by AGENT-EDGE.
+    _get_communication_manager(name)             # ensure it exists
+    return name
+
+
+def get_windbg_instance() -> str:
+    return _selected_instance()
+
+
+def interrupt_instance(name: str = "", timeout_ms: int = 15000) -> Dict[str, Any]:
+    """Interrupt a RUNNING target (programmatic Ctrl+Break).
+
+    Uses the extension's `interrupt` handler, which calls
+    IDebugControl::SetInterrupt(DEBUG_INTERRUPT_ACTIVE). Unlike `.break`/`.breakin`
+    (command strings that dbgeng refuses without a current scope), SetInterrupt is
+    reentrant and works while the target is executing -- including a kernel target
+    mid-boot.
+
+    Returns {"instance", "broke", "output"} or {"instance","error"}.
+    """
+    name = (name or "").strip() or _selected_instance()
+    mgr = _get_communication_manager(name)
+    try:
+        msg = MessageProtocol.create_handler_message("interrupt")
+        resp = mgr._send_message(msg, timeout_ms)
+        if not MessageProtocol.validate_response(resp):
+            return {"instance": name, "error": "invalid response", "raw": resp}
+        if resp.get("status") == "error":
+            return {"instance": name, "error": resp.get("error") or resp.get("error_message"),
+                    "raw": resp}
+        # The extension returns the handler's fields at the TOP LEVEL of the
+        # response ({"status":"success","broke":true,"output":"..."}), not
+        # nested under data/result. Read either shape.
+        top = resp if "broke" in resp else (resp.get("data") or resp.get("result") or {})
+        if isinstance(top, str):
+            return {"instance": name, "broke": "interrupt" in top, "output": top, "raw": resp}
+        broke = bool(top.get("broke")) if isinstance(top, dict) else False
+        out = top.get("output") if isinstance(top, dict) else top
+        res = {"instance": name, "broke": broke, "output": out or "", "raw": resp}
+        if not broke:
+            res["error"] = "interrupt did not land"
+        return res
+    except Exception as e:
+        return {"instance": name, "error": str(e)}
+
+
+def instance_status(name: str, timeout_ms: int = 3000) -> Dict[str, Any]:
+    """Live state of ONE session, cheap enough to call from /list.
+
+    Returns a struct, not a bare string:
+
+        {"id": "\\\\.\\pipe\\windbgmcp.NNNN",
+         "running": bool,      # True  -> target free-running (a break will not fire)
+         "halted":  bool,      # True  -> stopped at a prompt
+         "responds": bool,     # False -> pipe exists but the engine does not answer
+         "prompt": "0: kd>",   # the debugger's own prompt, when halted
+         "error": "..."}       # only when responds is False
+
+    Why this matters: a session can be PRESENT but free-running, and then no
+    breakpoint fires no matter how correct it is. /list only saying "the pipe
+    exists" hides exactly that, so every debugging round starts by guessing.
+    """
+    # No nulls. If the state cannot be determined we say so with a real value
+    # (`responds: false` plus an error string) instead of returning None, which
+    # reads as "some field I never filled in" and hides the failure.
+    res: Dict[str, Any] = {"id": name, "running": False, "responds": False,
+                           "prompt": "", "error": ""}
+    try:
+        # `.lastevent` is answered in BOTH states. A halted target returns a
+        # real event string and a concrete prompt ("0: kd>"); a running one
+        # returns "<no event>" and the indeterminate prompt "?: kd>".
+# Probe with vertarget, NOT .lastevent.
+        #
+        # .lastevent keeps answering "<no event>" on a DEAD KD transport, so /list
+        # happily reported running:true for four zombie EngHosts whose debugees
+        # were gone. vertarget is the command that tells the truth: a live target
+        # prints real uptime, a dead link prints "System Uptime: not available"
+        # (plus "Kernel transport in use, packet write failed"). The Uptime line
+        # cannot be fabricated by a stale cache.
+        # .lastevent is answered in BOTH states and carries the prompt, which is
+        # what tells a running target from a halted one.
+        #
+        # I briefly added a "zombie" heuristic here keyed on
+        #   "System Uptime: not available" / "packet write failed"
+        # and declared sessions dead. THAT WAS WRONG: "Uptime: not available" is
+        # simply what a PAUSED target reports. The sessions were alive the whole
+        # time and could be resumed. Do not invent liveness rules from output
+        # text -- ask the engine (break_in works, `g` works) instead.
+        out = send_command(".lastevent", timeout_ms=timeout_ms, instance=name, quiet=True) or ""
+    except Exception as e:
+        res["responds"] = False
+        res["error"] = str(e)
+        return res
+
+    res["responds"] = True
+    low = out.lower()
+    # prompt is the first "N: kd>" / "?: kd>" token in the captured text
+    for tok in out.split():
+        if tok.endswith("kd>") or tok.endswith("cdb>"):
+            res["prompt"] = tok
+            break
+    running = ("last event: <no event>" in low) or (res["prompt"] == "?:")
+    res["running"] = running
+    # Bugcheck detection, for /list.
+    #
+    # `running` alone cannot express the one state that matters most to an
+    # agent: the target is HALTED, but it is halted because Windows died, so
+    # nothing will ever resume it and every command describes a corpse. That
+    # was indistinguishable from "stopped at my breakpoint" in /list, and the
+    # difference decides whether the next move is `g` or a VM power cycle.
+    #
+    # Cheap test: a bugchecked kernel always has nt!KeBugCheck2 (or the
+    # KiBugCheck* family) on the stack, because it is sitting in the bugcheck
+    # path -- reached from DbgBreakPointWithStatus via
+    # KiBugCheckDebugBreak/KeBugCheckEx. `kb` is a single cheap command, and
+    # only issued when we already know the target is halted, so a free-running
+    # session costs nothing extra.
+    #
+    # Deliberately NOT keyed on the "A fatal system error has occurred" text:
+    # that string is also produced by a plain break on 80000003, so it would
+    # report every operator Ctrl+Break as a crash.
+    res["bugcheck"] = False
+    if not running:
+        try:
+            kbo = send_command("kb", timeout_ms=timeout_ms, instance=name, quiet=True) or ""
+            kbl = kbo.lower()
+            if ("nt!kebugcheck2" in kbl or "nt!kibugcheck" in kbl
+                    or "nt!kebugcheckex" in kbl):
+                res["bugcheck"] = True
+                # The stop code is the first 0xXXXXXXXX on the KeBugCheckEx
+                # frame; surfacing it saves a second round-trip to ask.
+                for _ln in kbo.splitlines():
+                    if "kibugcheckdispatch" in _ln.lower():
+                        res["bugcheck_frame"] = _ln.strip()[:160]
+                        break
+        except Exception:
+            # kb failing must not turn /list into an error; the other fields
+            # are still true and honest.
+            pass
+    res["halted"] = not running
+    if "break instruction exception" in low or "breakpoint" in low:
+        res["last_event"] = out.strip().splitlines()[-2:] and out.strip()[:200]
+    return res
+
 
 
 # Public API Functions
-def send_command(command: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> str:
+def send_command(command: str, timeout_ms: int = DEFAULT_TIMEOUT_MS,
+                 instance: Optional[str] = None, quiet: bool = False) -> str:
     """
     Send a command to the WinDbg extension.
     
     Args:
         command: The WinDbg command to execute
         timeout_ms: Timeout in milliseconds
+        instance: Optional WinDbgX pipe name; defaults to the selected instance
         
     Returns:
         The command output as a string
@@ -661,8 +1037,30 @@ def send_command(command: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> str:
         TimeoutError: If the command times out
         CommunicationError: If the command fails
     """
-    manager = _get_communication_manager()
-    return manager.send_command(command, timeout_ms)
+    manager = _get_communication_manager(instance)
+    # `quiet` must be forwarded: the manager accepts it (it routes output to the
+    # callback only, so internal probes do not appear in the console). The module
+    # wrapper used to drop it, so instance_status() -- which passes quiet=True --
+    # raised "unexpected keyword argument 'quiet'" and the caller turned that into
+    # all-null fields. A null that means "I did not check" is worse than an
+    # honest error.
+    return manager.send_command(command, timeout_ms, quiet)
+
+
+async def send_command_async(command: str, timeout_ms: int = DEFAULT_TIMEOUT_MS,
+                             instance: Optional[str] = None) -> str:
+    """Awaitable send_command: runs the BLOCKING named-pipe I/O in a thread pool.
+
+    MCP tool handlers are `async def`; calling the synchronous send_command()
+    from them blocks the asyncio event loop, so one agent waiting on an
+    unresponsive target froze every other session AND GET /list. Always use this
+    from async code.
+    """
+    loop = _asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        _pipe_executor(),
+        lambda: send_command(command, timeout_ms=timeout_ms, instance=instance),
+    )
 
 
 def send_handler_command(handler_name: str, timeout_ms: int = DEFAULT_TIMEOUT_MS, **kwargs) -> Dict[str, Any]:

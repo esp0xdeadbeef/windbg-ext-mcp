@@ -10,6 +10,49 @@ from typing import Dict, Any, List, Optional, Union
 from fastmcp import FastMCP, Context
 
 from core.communication import send_command, TimeoutError, CommunicationError
+
+
+async def send_command_offloop(command: str, timeout_ms: int = None, **kw):
+    """send_command() WITHOUT parking the asyncio event loop.
+
+    These handlers are `async def`, but send_command() does blocking named-pipe
+    I/O. Calling it directly froze the whole event loop -- so GET /list and MCP
+    calls to OTHER sessions stopped answering for as long as any one command was
+    running. Pushing the blocking call into a worker thread keeps the HTTP layer
+    responsive; per-session serialisation is still enforced by that session's
+    pipe, which is the correct place for it.
+    """
+    import asyncio as _aio
+    loop = _aio.get_event_loop()
+
+    # CARRY THE INSTANCE PIN INTO THE WORKER THREAD.
+    #
+    # select_thread_instance() stores the pin in a THREAD-LOCAL. run_in_executor
+    # runs the call on a different thread, where that local is unset, so
+    # send_command fell back to the process-wide default -- whichever instance was
+    # selected last. Same bug as run_command(); measured as "every analyze_* call
+    # lands in AWE_04 no matter which instance= I pass".
+    # Read the pin on THIS (asyncio) thread, where select_thread_instance() put
+    # it, then re-apply it inside the worker. Reading it inside the worker would
+    # just read the empty thread-local that caused the bug.
+    try:
+        from core.communication import _thread_local
+        _inst = getattr(_thread_local, "instance", None)
+    except Exception:
+        _inst = None
+
+    def _pinned(fn):
+        def run():
+            if _inst:
+                from core.communication import select_thread_instance as _sti
+                _sti(_inst)
+            return fn()
+        return run
+
+    if timeout_ms is None:
+        return await loop.run_in_executor(None, _pinned(lambda: send_command(command, **kw)))
+    return await loop.run_in_executor(
+        None, _pinned(lambda: send_command(command, timeout_ms=timeout_ms, **kw)))
 from core.context import get_context_manager
 from core.error_handler import enhance_error, error_enhancer, DebugContext, ErrorCategory
 from core.hints import get_parameter_help, validate_tool_parameters
@@ -77,7 +120,7 @@ def register_analysis_tools(mcp: FastMCP):
             if action == "list":
                 # List all processes
                 try:
-                    result = send_command("!process 0 0", timeout_ms=_get_timeout("!process 0 0"))
+                    result = await send_command_offloop("!process 0 0", timeout_ms=_get_timeout("!process 0 0"))
                     
                     return {
                         "output": result,
@@ -109,7 +152,7 @@ def register_analysis_tools(mcp: FastMCP):
                 try:
                     # Switch to the specified process
                     switch_cmd = f".process /i {address}"
-                    result = send_command(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
+                    result = await send_command_offloop(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
                     
                     return {
                         "success": True,
@@ -133,7 +176,7 @@ def register_analysis_tools(mcp: FastMCP):
                 
                 try:
                     # Get detailed process information
-                    result = send_command(f"!process {address} 7", timeout_ms=_get_timeout(f"!process {address} 7"))
+                    result = await send_command_offloop(f"!process {address} 7", timeout_ms=_get_timeout(f"!process {address} 7"))
                     return {"output": result, "process_address": address}
                 except (CommunicationError, TimeoutError) as e:
                     enhanced_error = enhance_error("timeout", command=f"!process {address} 7", timeout_ms=_get_timeout(f"!process {address} 7"))
@@ -155,9 +198,9 @@ def register_analysis_tools(mcp: FastMCP):
                     if address:
                         # Switch to process first, then get PEB
                         switch_cmd = f".process /i {address}"
-                        send_command(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
+                        await send_command_offloop(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
                         
-                    peb_result = send_command("!peb", timeout_ms=_get_timeout("!peb"))
+                    peb_result = await send_command_offloop("!peb", timeout_ms=_get_timeout("!peb"))
                     return {"output": peb_result, "context": "Process Environment Block"}
                     
                 except (CommunicationError, TimeoutError) as e:
@@ -172,7 +215,7 @@ def register_analysis_tools(mcp: FastMCP):
                     success = context_mgr.pop_context(send_command)
                     if success:
                         error_enhancer.update_context(DebugContext.UNKNOWN)  # Reset context
-                        result = send_command("!peb", timeout_ms=_get_timeout("!peb"))
+                        result = await send_command_offloop("!peb", timeout_ms=_get_timeout("!peb"))
                         return {"success": True, "message": "Context restored", "current_context": result[:200]}
                     else:
                         return {"success": False, "message": "No saved context to restore"}
@@ -219,7 +262,7 @@ def register_analysis_tools(mcp: FastMCP):
             if action == "list":
                 # List all threads
                 try:
-                    result = send_command("!thread", timeout_ms=_get_timeout("!thread"))
+                    result = await send_command_offloop("!thread", timeout_ms=_get_timeout("!thread"))
                     return {"output": result, "note": "Copy thread address for detailed analysis"}
                 except Exception as e:
                     enhanced_error = enhance_error("execution", command="!thread", original_error=str(e))
@@ -232,7 +275,7 @@ def register_analysis_tools(mcp: FastMCP):
                 
                 try:
                     switch_cmd = f"~{address}s"
-                    result = send_command(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
+                    result = await send_command_offloop(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
                     return {"output": result, "switched_to": address}
                 except Exception as e:
                     enhanced_error = enhance_error("execution", command=switch_cmd, original_error=str(e))
@@ -244,7 +287,7 @@ def register_analysis_tools(mcp: FastMCP):
                     return enhanced_error.to_dict()
                 
                 try:
-                    result = send_command(f"!thread {address}", timeout_ms=_get_timeout(f"!thread {address}"))
+                    result = await send_command_offloop(f"!thread {address}", timeout_ms=_get_timeout(f"!thread {address}"))
                     return {"output": result, "thread_address": address}
                 except Exception as e:
                     enhanced_error = enhance_error("execution", command=f"!thread {address}", original_error=str(e))
@@ -255,9 +298,9 @@ def register_analysis_tools(mcp: FastMCP):
                     if address:
                         # Switch to thread first, then get stack
                         switch_cmd = f"~{address}s"
-                        send_command(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
+                        await send_command_offloop(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
                     
-                    stack_result = send_command(f"k {count}", timeout_ms=_get_timeout(f"k {count}"))
+                    stack_result = await send_command_offloop(f"k {count}", timeout_ms=_get_timeout(f"k {count}"))
                     return {"output": stack_result, "stack_frames": count}
                 except Exception as e:
                     enhanced_error = enhance_error("execution", command=f"k {count}", original_error=str(e))
@@ -265,10 +308,10 @@ def register_analysis_tools(mcp: FastMCP):
                     
             elif action == "all_stacks":
                 try:
-                    result = send_command(f"k {count}", timeout_ms=_get_timeout(f"k {count}"))
+                    result = await send_command_offloop(f"k {count}", timeout_ms=_get_timeout(f"k {count}"))
                     
                     # Get basic thread list for context
-                    thread_list = send_command("!thread", timeout_ms=_get_timeout("!thread"))
+                    thread_list = await send_command_offloop("!thread", timeout_ms=_get_timeout("!thread"))
                     
                     # For performance, show limited stacks for multiple threads
                     stacks = []
@@ -276,7 +319,7 @@ def register_analysis_tools(mcp: FastMCP):
                         # Try to get stacks for a few threads (simplified approach)
                         for i in range(min(3, count // 10)):  # Sample a few threads
                             try:
-                                stack = send_command("k 10", timeout_ms=_get_timeout("k 10"))  # Shorter stacks for multiple threads
+                                stack = await send_command_offloop("k 10", timeout_ms=_get_timeout("k 10"))  # Shorter stacks for multiple threads
                                 stacks.append(f"Thread {i} stack (sample):\n{stack}")
                             except:
                                 continue
@@ -305,9 +348,9 @@ def register_analysis_tools(mcp: FastMCP):
                     if address:
                         # Switch to thread first
                         switch_cmd = f"~{address}s"
-                        send_command(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
+                        await send_command_offloop(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
                         
-                    teb_result = send_command("!teb", timeout_ms=_get_timeout("!teb"))
+                    teb_result = await send_command_offloop("!teb", timeout_ms=_get_timeout("!teb"))
                     return {"output": teb_result, "context": "Thread Environment Block"}
                 except Exception as e:
                     enhanced_error = enhance_error("execution", command="!teb", original_error=str(e))

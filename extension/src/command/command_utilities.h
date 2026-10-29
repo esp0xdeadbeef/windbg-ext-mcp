@@ -8,6 +8,12 @@
 #include <chrono>
 #include <mutex>
 
+// GetOrCreateClient() exposes the process-wide client/callback pair, so the
+// callback type must be COMPLETE here (CComPtr<OutputCallbacks> instantiates
+// against it in command_utilities.cpp; a forward declaration gives
+// "use of undefined type 'OutputCallbacks'" from atlcomcli.h).
+#include "../utils/output_callbacks.h"
+
 using json = nlohmann::json;
 
 // Error categories for better error handling
@@ -62,7 +68,13 @@ public:
      * @return Command output as string.
      * @throws std::exception on execution failure.
      */
-    static std::string ExecuteWinDbgCommand(const std::string& command, unsigned int timeoutMs = Constants::DEFAULT_TIMEOUT_MS);
+    static std::string ExecuteWinDbgCommand(const std::string& command, unsigned int timeoutMs = Constants::DEFAULT_TIMEOUT_MS, bool quiet = false);
+
+    // Returns the process-wide dbgeng client + its output callback, creating them
+    // once. Everything that talks to the engine must use this: a second client
+    // has no target, so interrupting through it does nothing and destabilises the
+    // session.
+    static HRESULT GetOrCreateClient(IDebugClient** outClient, OutputCallbacks** outCallbacks);
 
     // Response creation methods
     

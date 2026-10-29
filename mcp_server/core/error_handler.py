@@ -421,6 +421,29 @@ def enhance_error(error_type: str, **kwargs) -> EnhancedError:
             kwargs.get("command", ""),
             kwargs.get("timeout_ms", 30000)
         )
+    elif error_type == "execution":
+        # THERE WAS NO BRANCH HERE. Every execution failure fell through to the
+        # `else` below, which reads kwargs["message"] -- but the caller in
+        # execution_tools.run_command passes original_error=, not message=.
+        # So every failing command reported literally "Unknown error" and threw
+        # away the real text (e.g. "WinDbg command failed: ...", "pipe busy",
+        # HRESULT messages). Hours were lost blaming the bridge.
+        _detail = kwargs.get("original_error") or ""
+        _cmd = kwargs.get("command") or ""
+        _tmc = kwargs.get("timeout_category")
+        if _detail:
+            _msg = str(_detail)
+            if _cmd:
+                _msg = "command %r failed: %s" % (_cmd, _msg)
+        elif _tmc:
+            _msg = "command %r failed (timeout category: %s)" % (_cmd, _tmc)
+        else:
+            _msg = "command %r failed" % (_cmd,)
+        return EnhancedError(
+            category=ErrorCategory.WORKFLOW,
+            message=_msg,
+            debug_context=error_enhancer.current_context
+        )
     else:
         return EnhancedError(
             category=ErrorCategory.WORKFLOW,

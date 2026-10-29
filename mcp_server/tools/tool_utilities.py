@@ -16,16 +16,27 @@ def detect_kernel_mode() -> bool:
         from core.execution.timeout_resolver import resolve_timeout
         from config import DebuggingMode
 
+        # Use `.effmach`, NOT `version`.
+        #
+        # `version` prints the entire debugger banner (Windows version, Product,
+        # Edition build lab, session/uptime, copyright, EngHost command line,
+        # dbgeng/dbghelp paths, DIA version, extension search path and the DLL
+        # chain). This function runs on EVERY command, and because the console
+        # mirrors command output, that banner appeared after each one -- the
+        # "banner spam" that looked unfixable from the extension side.
+        #
+        # `.effmach` answers in one line and reports the effective processor:
+        #   user mode -> "Effective machine: x64 (AMD64)"
+        #   kernel    -> "... x64 kernel ..."
         timeout_ms = resolve_timeout(".effmach", DebuggingMode.VM_NETWORK)
-        result = send_command(".effmach", timeout_ms=timeout_ms)
-        if result and any(x in result.lower() for x in ["x64_kernel", "x86_kernel", "kernel mode"]):
+        result = send_command(".effmach", timeout_ms=timeout_ms, quiet=True)
+        low = (result or "").lower()
+        if "kernel" in low:
             return True
+        if "effective machine" in low or "x64" in low or "x86" in low:
+            return False
 
-        timeout_ms = resolve_timeout("!pcr", DebuggingMode.VM_NETWORK)
-        result = send_command("!pcr", timeout_ms=timeout_ms)
-        if result and not result.startswith("Error:") and "is not a recognized" not in result:
-            return True
-
+        # Nothing recognisable: assume user mode, which is what this lab uses.
         return False
     except Exception:
         return False

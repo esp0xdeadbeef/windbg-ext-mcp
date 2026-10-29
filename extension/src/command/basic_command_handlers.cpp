@@ -3,12 +3,14 @@
 #include "command/command_utilities.h"
 #include "../ipc/mcp_server.h"  // Include MCPServer definition
 #include "../utils/constants.h"
+#include <atlbase.h>   // CComPtr / CComQIPtr (OSEE interrupt handler)
 
 void BasicCommandHandlers::RegisterHandlers(MCPServer& server) {
     // Register basic command handlers
     server.RegisterHandler("check_connection", CheckConnectionHandler);
     server.RegisterHandler("version", VersionHandler);
     server.RegisterHandler("get_metadata", GetMetadataHandler);
+    server.RegisterHandler("interrupt", InterruptHandler);   // OSEE: programmatic Ctrl+Break
     server.RegisterHandler("lm", ListModulesHandler);
     server.RegisterHandler("dt", DisplayTypeHandler);
     server.RegisterHandler("dd", DisplayMemoryHandler);
@@ -176,4 +178,61 @@ json BasicCommandHandlers::DisplayMemoryHandler(const json& message) {
             std::string("Command failed: ") + e.what()
         );
     }
-} 
+}
+
+
+// ---------------------------------------------------------------------------
+// InterruptHandler -- programmatic Ctrl+Break (OSEE patch).
+//
+// ".break" / ".breakin" are COMMAND STRINGS: dbgeng refuses them while the
+// target runs because there is no current scope ("'.break outside of scope").
+// IDebugControl::SetInterrupt() is different -- per dbgeng.h it "registers a
+// user interrupt" and is explicitly reentrant, so it can be called from any
+// client/thread while the engine is blocked in WaitForEvent. It is the API
+// behind Ctrl+Break and works on a free-running (kernel) target.
+// ---------------------------------------------------------------------------
+json BasicCommandHandlers::InterruptHandler(const json& message) {
+    const int id = message.value("id", 0);
+
+    // Use the PROCESS-WIDE client, not a fresh DebugCreate.
+    //
+    // A newly created IDebugClient has no target attached. SetInterrupt() on it
+    // either fails or interrupts nothing, and — worse — creating a second client
+    // while the singleton is mid-command perturbs the engine so the session dies
+    // (observed: /list goes empty and the UDP listener frees right after an
+    // interrupt, i.e. the whole WinDbgX/EngHost went away).
+    //
+    // GetOrCreateClient() returns the same client the command path uses, so the
+    // interrupt lands on the engine that actually owns the target.
+    CComPtr<IDebugClient> client;
+    CComPtr<OutputCallbacks> cbs;
+    HRESULT hr = CommandUtilities::GetOrCreateClient(&client, &cbs);
+    if (FAILED(hr))
+        return CommandUtilities::CreateErrorResponse(id, "interrupt", "GetOrCreateClient failed");
+
+    CComQIPtr<IDebugControl> control(client);
+    if (!control)
+        return CommandUtilities::CreateErrorResponse(id, "interrupt", "no IDebugControl");
+
+    ULONG before = 0;
+    control->GetExecutionStatus(&before);
+
+    hr = control->SetInterrupt(DEBUG_INTERRUPT_ACTIVE);
+    if (FAILED(hr))
+        return CommandUtilities::CreateErrorResponse(id, "interrupt", "SetInterrupt failed");
+
+    bool broke = false;
+    for (int i = 0; i < 50; ++i) {
+        Sleep(100);
+        ULONG st = 0;
+        control->GetExecutionStatus(&st);
+        if (st == DEBUG_STATUS_BREAK) { broke = true; break; }
+    }
+
+    std::string out = broke ? "target interrupted (break)"
+                            : "interrupt requested; target not yet reported break";
+    json resp = CommandUtilities::CreateSuccessResponse(id, "interrupt", out);
+    resp["broke"] = broke;
+    resp["was_running"] = (before != DEBUG_STATUS_BREAK);
+    return resp;
+}

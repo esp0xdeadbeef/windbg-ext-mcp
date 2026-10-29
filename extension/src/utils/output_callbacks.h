@@ -8,6 +8,7 @@
 #include <Windows.h>
 #include <DbgEng.h>
 #include <string>
+#include <mutex>
 
 // Maximum size for command output to prevent excessive memory usage
 constexpr size_t MAX_OUTPUT_SIZE = 1024 * 1024; // 1MB
@@ -49,6 +50,12 @@ public:
     void Clear();
 
 private:
+    // m_output is written by dbgeng's output-callback thread and read by the
+    // MCP command thread. Without this mutex the two race, and a read that lands
+    // mid-write returns an empty or truncated string -- which surfaces as
+    // "command returned no output" (reported to the client as the useless
+    // "Unknown error") for perfectly valid commands like `lm`.
+    mutable std::mutex m_outputMutex;
     std::string m_output;        ///< Buffer storing captured output
     LONG m_refCount;             ///< Reference count for COM interface
     bool m_extensionError{false}; ///< Flag indicating if an extension error occurred

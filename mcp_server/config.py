@@ -13,7 +13,17 @@ from dataclasses import dataclass
 # ====================================================================
 
 # Named pipe configuration
-PIPE_NAME = r"\\.\pipe\windbgmcp"
+# OSEE multi-instance patch: PIPE_NAME stays the legacy default, and PIPE_NAMES
+# lists every instance the bridge may talk to. Overridable via env vars:
+#   WINDBGMCP_PIPE    -> single pipe name
+#   WINDBGMCP_PIPES   -> comma-separated list of pipe names
+import os as _os
+DEFAULT_PIPE_NAME = r"\\.\pipe\windbgmcp"
+PIPE_NAME = _os.environ.get("WINDBGMCP_PIPE", DEFAULT_PIPE_NAME)
+PIPE_NAMES = [p.strip() for p in
+              _os.environ.get("WINDBGMCP_PIPES", "").split(",") if p.strip()]
+if not PIPE_NAMES:
+    PIPE_NAMES = [PIPE_NAME]
 BUFFER_SIZE = 8192
 
 # Basic timeout settings (in milliseconds)

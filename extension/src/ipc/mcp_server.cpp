@@ -6,6 +6,31 @@
 // Buffer size for reading from the pipe
 constexpr DWORD BUFFER_SIZE = 4096;
 
+// ---------------------------------------------------------------------------
+// Log gating (OSEE tools/windbgx-mcp patch 0002).
+//
+// The Python bridge opens a fresh pipe connection per command, so the routine
+// connect/disconnect chatter floods the WinDbgX command pane. Log the first
+// connect once; keep the rest behind WINDBGMCP_VERBOSE=1 (set it in the
+// launcher before starting WinDbgX and EngHost inherits it). Error paths are
+// never gated.
+// ---------------------------------------------------------------------------
+static bool McpVerbose() {
+    static const bool verbose = [] {
+        char buf[8] = {};
+        DWORD n = GetEnvironmentVariableA("WINDBGMCP_VERBOSE", buf, sizeof(buf));
+        return n > 0 && n < sizeof(buf) && buf[0] != '0';
+    }();
+    return verbose;
+}
+
+static bool McpFirstConnect() {
+    static std::atomic<bool> seen{ false };
+    return !seen.exchange(true);
+}
+
+#define MCP_VERBOSE_LOG(...) do { if (McpVerbose()) dprintf(__VA_ARGS__); } while (0)
+
 MCPServer::MCPServer() : m_running(false) {
 }
 
@@ -123,11 +148,14 @@ void MCPServer::PipeServerThread() {
         }
 
         // Wait for a client to connect
-        dprintf("MCPServer: Waiting for client connection on %s\n", m_pipeName.c_str());
+        MCP_VERBOSE_LOG("MCPServer: Waiting for client connection on %s\n", m_pipeName.c_str());
         BOOL connected = ConnectNamedPipe(hPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
         
         if (connected) {
-            dprintf("MCPServer: New client connected\n");
+            // Log the first connect once; the bridge reconnects per command.
+            if (McpVerbose() || McpFirstConnect()) {
+                dprintf("MCPServer: New client connected\n");
+            }
             
             // Create a new client connection
             auto client = std::make_shared<ClientConnection>(hPipe);
@@ -318,7 +346,7 @@ void MCPServer::HandleClient(std::shared_ptr<ClientConnection> client) {
     
     // Mark client as inactive when exiting
     client->active = false;
-    dprintf("MCPServer: Client handler thread exiting\n");
+    MCP_VERBOSE_LOG("MCPServer: Client handler thread exiting\n");
 }
 
 json MCPServer::ProcessMessage(const json& message) {

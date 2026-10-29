@@ -13,6 +13,7 @@ from .analysis_tools import register_analysis_tools
 
 from .performance_tools import register_performance_tools
 from .support_tools import register_support_tools
+from .ttd_tools import register_ttd_tools
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,10 @@ def register_all_tools(mcp: FastMCP) -> None:
         # Register support tools
         logger.debug("Registering support tools...")
         register_support_tools(mcp)
+
+        # Register TTD (time-travel) tools
+        logger.debug("Registering TTD tools...")
+        register_ttd_tools(mcp)
         
         logger.info("Successfully registered all MCP tools")
         
@@ -83,6 +88,10 @@ TOOL_CATEGORIES = {
     "support": {
         "tools": ["troubleshoot", "get_help", "test_windbg_communication", "network_debugging_troubleshoot"],
         "description": "Tools for troubleshooting issues and getting help"
+    },
+    "time_travel": {
+        "tools": ["ttd_record", "ttd_launch", "ttd_status", "ttd_stop", "ttd_open", "ttd_seek"],
+        "description": "Record/open TTD time-travel traces and seek within them"
     }
 }
 

@@ -25,6 +25,7 @@ json EnhancedCommandHandlers::ExecuteCommandHandler(const json& message) {
         auto args = message.value("args", json::object());
         std::string command = args.value("command", "");
         unsigned int timeout = args.value("timeout_ms", 30000u);  // Increased default timeout to 30 seconds
+        bool quiet = args.value("quiet", false);
         
         if (command.empty()) {
             return CommandUtilities::CreateDetailedErrorResponse(
@@ -69,7 +70,7 @@ json EnhancedCommandHandlers::ExecuteCommandHandler(const json& message) {
         }
         
         try {
-            std::string output = CommandUtilities::ExecuteWinDbgCommand(command, timeout);
+            std::string output = CommandUtilities::ExecuteWinDbgCommand(command, timeout, quiet);
             auto end_time = std::chrono::steady_clock::now();
             double execution_time = std::chrono::duration<double>(end_time - start_time).count();
             CommandUtilities::UpdateGlobalPerformanceMetrics(execution_time);
