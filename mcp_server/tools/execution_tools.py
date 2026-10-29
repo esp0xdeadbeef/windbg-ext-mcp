@@ -280,7 +280,7 @@ def register_execution_tools(mcp: FastMCP):
         """
         logger.debug(f"Executing command: {command}, validate: {validate}, resilient: {resilient}, optimize: {optimize}, instance: {instance}")
 
-        # OSEE multi-instance patch: per-call instance wins; otherwise use the
+        # Multi-instance: a per-call instance wins; otherwise use the
         # pipe this MCP CLIENT session pinned via select_instance. Both are put in
         # the thread-local, which is what send_command() consults. Without the
         # client pin, two agents' selections collided and both drove the same
@@ -355,9 +355,9 @@ def register_execution_tools(mcp: FastMCP):
             #
             # Measured symptom: /list correctly showed three sessions with
             # distinct running states, but every run_command with instance=<X>
-            # landed in ONE session (AWE_04). The pin was silently discarded, so
-            # kernel commands drove the wrong VM -- the worst possible failure for
-            # a debugger bridge, because the output looks plausible.
+            # landed in ONE session. The pin was silently discarded, so kernel
+            # commands drove the wrong VM -- the worst possible failure for a
+            # debugger bridge, because the output looks plausible.
             _pinned = _explicit
 
             def _run_pinned_cmd(cmd):

@@ -31,7 +31,7 @@ async def send_command_offloop(command: str, timeout_ms: int = None, **kw):
     # runs the call on a different thread, where that local is unset, so
     # send_command fell back to the process-wide default -- whichever instance was
     # selected last. Same bug as run_command(); measured as "every analyze_* call
-    # lands in AWE_04 no matter which instance= I pass".
+    # lands in one session no matter which instance= I pass".
     # Read the pin on THIS (asyncio) thread, where select_thread_instance() put
     # it, then re-apply it inside the worker. Reading it inside the worker would
     # just read the empty thread-local that caused the bug.

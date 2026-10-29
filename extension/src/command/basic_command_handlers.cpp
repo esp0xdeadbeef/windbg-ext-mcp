@@ -3,14 +3,14 @@
 #include "command/command_utilities.h"
 #include "../ipc/mcp_server.h"  // Include MCPServer definition
 #include "../utils/constants.h"
-#include <atlbase.h>   // CComPtr / CComQIPtr (OSEE interrupt handler)
+#include <atlbase.h>   // CComPtr / CComQIPtr (interrupt handler)
 
 void BasicCommandHandlers::RegisterHandlers(MCPServer& server) {
     // Register basic command handlers
     server.RegisterHandler("check_connection", CheckConnectionHandler);
     server.RegisterHandler("version", VersionHandler);
     server.RegisterHandler("get_metadata", GetMetadataHandler);
-    server.RegisterHandler("interrupt", InterruptHandler);   // OSEE: programmatic Ctrl+Break
+    server.RegisterHandler("interrupt", InterruptHandler);   // programmatic Ctrl+Break
     server.RegisterHandler("lm", ListModulesHandler);
     server.RegisterHandler("dt", DisplayTypeHandler);
     server.RegisterHandler("dd", DisplayMemoryHandler);
@@ -182,7 +182,7 @@ json BasicCommandHandlers::DisplayMemoryHandler(const json& message) {
 
 
 // ---------------------------------------------------------------------------
-// InterruptHandler -- programmatic Ctrl+Break (OSEE patch).
+// InterruptHandler -- programmatic Ctrl+Break.
 //
 // ".break" / ".breakin" are COMMAND STRINGS: dbgeng refuses them while the
 // target runs because there is no current scope ("'.break outside of scope").

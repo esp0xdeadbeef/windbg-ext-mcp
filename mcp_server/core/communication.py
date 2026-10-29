@@ -422,7 +422,7 @@ class CommunicationManager:
         self._health_lock = threading.Lock()
         self._connection_pool = ConnectionPool()
 
-    # --- multi-instance support (OSEE patch) --------------------------------
+    # --- multi-instance support ---------------------------------------------
     def set_instance(self, pipe_name: str) -> None:
         """Select which WinDbgX instance (named pipe) commands go to."""
         self._connection_pool._pipe_name = pipe_name
@@ -671,7 +671,7 @@ class CommunicationManager:
                 self._connection_health.extension_responsive = False
 
 
-# Global Communication Manager Instance (per-instance registry, OSEE patch)
+# Global Communication Manager Instance (per-instance registry)
 _communication_managers: Dict[str, CommunicationManager] = {}
 _current_instance: Optional[str] = None
 # Thread-local selected instance so concurrent MCP calls don't clobber each
@@ -769,12 +769,13 @@ def _selected_instance() -> str:
             "instance=...; refusing to fall back to a different session."
             % (want, live))
     # NOTHING SELECTED. Picking live[0] here used to return whatever sorted
-    # first -- with four kernel kdbg.* sessions and one userland session live,
-    # `current` became kdbg.AWE_EM_01 and unpinned calls silently drove a
+    # first -- with several kernel sessions and one userland session live,
+    # `current` became a kernel session and unpinned calls silently drove a
     # KERNEL debugger while the caller believed it was on its own userland
     # target (measured: `kb` answered nt!DbgBreakPointWithStatus/kdnic for a
-    # request meant for php.exe). The wrong session answering successfully is
-    # exactly what makes this invisible, so refuse instead of guessing.
+    # request meant for the attached user-mode process). The wrong session
+    # answering successfully is exactly what makes this invisible, so refuse
+    # instead of guessing.
     if len(live) > 1:
         raise RuntimeError(
             "no instance selected and %d are live (%s). Pin one with "
@@ -785,7 +786,7 @@ def _selected_instance() -> str:
     return PIPE_NAMES[0] if PIPE_NAMES else PIPE_NAME
 
 
-# --- multi-instance support (OSEE patch) ------------------------------------
+# --- multi-instance support ------------------------------------------------
 def _discover_pipes() -> list:
     r"""Enumerate LIVE WinDbgX pipes by scanning the named-pipe namespace.
 

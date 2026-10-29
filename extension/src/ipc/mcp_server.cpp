@@ -7,7 +7,7 @@
 constexpr DWORD BUFFER_SIZE = 4096;
 
 // ---------------------------------------------------------------------------
-// Log gating (OSEE tools/windbgx-mcp patch 0002).
+// Log gating.
 //
 // The Python bridge opens a fresh pipe connection per command, so the routine
 // connect/disconnect chatter floods the WinDbgX command pane. Log the first

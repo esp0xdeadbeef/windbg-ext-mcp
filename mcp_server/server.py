@@ -24,7 +24,7 @@ from core.server_initialization import ServerInitializer, InitializationConfig
 
 
 # ---------------------------------------------------------------------------
-# Transport hook (added by the OSEE tools/windbgx-mcp patch).
+# Transport hook (Streamable HTTP).
 #
 # Upstream hardwires stdio, which is unreachable from another machine. This
 # lets the same process serve MCP over Streamable HTTP so a remote client
@@ -232,7 +232,7 @@ class WinDbgMCPServer:
                 #      that diffs /list (or a human glancing at it) saw the same
                 #      set of sessions appear to "move" on every call.
                 #   2. One-port-per-VM means the ids are already unique and
-                #      meaningful (windbgmcp.kdbg.AWE_02 ... AWE_EM_01), so sorting
+                #      meaningful (windbgmcp.kdbg.<vm>), so sorting
                 #      groups them stably per machine.
                 # Failures carry id="" and sort first; keep them visible rather
                 # than dropping them, sorted by their error text.

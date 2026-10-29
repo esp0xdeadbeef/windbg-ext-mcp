@@ -40,14 +40,14 @@ HANDLE g_shutdownEvent = nullptr;
  */
 #include <cstdio>  // _snprintf_s
 
-// --- per-instance pipe name resolution (OSEE multi-instance patch) ---
+// --- per-instance pipe name resolution ---
 // Priority: WINDBGMCP_PIPE env var > "\\.\pipe\windbgmcp.<pid>".
 static std::string ResolveMcpPipeName() {
 	char buf[512] = {0};
 	DWORD n = GetEnvironmentVariableA("WINDBGMCP_PIPE", buf, sizeof(buf));
 	if (n > 0 && n < sizeof(buf)) {
 		std::string want(buf, n);
-		// Callers pass a BARE name ("windbgmcp.kdbg.AWE_03"). CreateNamedPipeA
+		// Callers may pass a BARE name ("windbgmcp.kdbg.target01"). CreateNamedPipeA
 		// needs the object-manager path, and without the prefix it fails with
 		// error 123 ERROR_INVALID_NAME, so the pipe is never created even though
 		// the extension prints "MCP server started on pipe: ...".

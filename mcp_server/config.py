@@ -13,7 +13,7 @@ from dataclasses import dataclass
 # ====================================================================
 
 # Named pipe configuration
-# OSEE multi-instance patch: PIPE_NAME stays the legacy default, and PIPE_NAMES
+# Multi-instance: PIPE_NAME stays the legacy default, and PIPE_NAMES
 # lists every instance the bridge may talk to. Overridable via env vars:
 #   WINDBGMCP_PIPE    -> single pipe name
 #   WINDBGMCP_PIPES   -> comma-separated list of pipe names
