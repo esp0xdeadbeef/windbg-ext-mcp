@@ -78,6 +78,27 @@ public:
      */
     static json DisplayMemoryHandler(const json& message);
 
+    /**
+     * @brief Return the console transcript.
+     *
+     * The per-command reply (run_command) is capped and covers ONE command.
+     * This returns the accumulated session transcript instead, so a caller can
+     * read back everything the debugger printed (each command echoed with its
+     * prompt).
+     *
+     * Args:
+     *   max_bytes (int, 0 = the log's own cap)  Hard cap on the returned text.
+     *   last_command (bool, default false)      Return only the most recent
+     *        command's transcript -- the uncapped form of its reply.
+     *
+     * There is deliberately NO clear/reset option: the transcript is evidence,
+     * and an accidental wipe (script, retry loop, another agent on the pipe)
+     * destroys exactly what was wanted. Do not add one.
+     *
+     * @return JSON response with `output`, `bytes`, `truncated`, `last_command`.
+     */
+    static json GetConsoleLogHandler(const json& message);
+
 private:
     // Basic command handlers are straightforward and don't need helper methods
 }; 

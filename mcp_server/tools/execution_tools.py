@@ -263,7 +263,7 @@ def register_execution_tools(mcp: FastMCP):
         return await continue_session(ctx, instance)
 
     @mcp.tool()
-    async def run_command(ctx: Context, action: str = "", command: str = "", validate: bool = True, resilient: bool = True, optimize: bool = True, instance: str = "") -> Union[str, Dict[str, Any]]:
+    async def run_command(ctx: Context, action: str = "", command: str = "", validate: bool = True, resilient: bool = True, optimize: bool = True, instance: str = "", full_output: bool = False, max_output_bytes: int = 0) -> Union[str, Dict[str, Any]]:
         """
         Execute a WinDbg command with validation, resilience, and performance optimization.
         
@@ -274,6 +274,17 @@ def register_execution_tools(mcp: FastMCP):
             validate: Whether to validate the command for safety (default: True)
             resilient: Whether to use resilient execution with retries (default: True)  
             optimize: Whether to use performance optimization (default: True)
+            instance: WinDbgX pipe name pinning this call to one session
+            full_output: Also return the UNTRUNCATED transcript of this command
+                as ``console_output`` (plus ``console_output_bytes`` /
+                ``console_output_truncated``). The extension caps a normal reply
+                (1MB) so a huge command cannot bloat the JSON; set this to get
+                everything for one deliberately-big command. ``result`` keeps
+                its usual (capped) value -- use ``console_output`` when you need
+                the whole thing. The transcript ACROSS commands is
+                ``get_console_log``.
+            max_output_bytes: Cap for ``console_output`` when full_output is set
+                (0 = the extension's own, larger console cap).
             
         Returns:
             Command result or error information
@@ -382,7 +393,28 @@ def register_execution_tools(mcp: FastMCP):
             
             if execution_result.success:
                 # Convert to legacy format for backward compatibility
-                return execution_result.to_legacy_format()
+                legacy = execution_result.to_legacy_format()
+                if full_output:
+                    # The reply above is capped at the extension's per-command
+                    # limit. Re-read the same command's buffer UNCAPPED via the
+                    # console handler so a caller can opt out of truncation for
+                    # one command (e.g. a large `lm` or `!process 0 0`) without
+                    # having to fetch the whole session transcript.
+                    try:
+                        from core.communication import send_handler_command as _shc
+                        _log = _shc("get_console_log", timeout_ms=30000,
+                                    instance=_explicit,
+                                    max_bytes=int(max_output_bytes or 0),
+                                    last_command=True)
+                        _txt = (_log or {}).get("output", "") or ""
+                        if _txt:
+                            legacy["console_output"] = _txt
+                            legacy["console_output_bytes"] = len(_txt)
+                            legacy["console_output_truncated"] = bool(
+                                (_log or {}).get("truncated", False))
+                    except Exception as e:
+                        legacy["console_output_error"] = str(e)
+                return legacy
             else:
                 # ON FAILURE, TELL THE CALLER WHETHER THE TARGET IS RUNNING.
                 #
@@ -445,6 +477,98 @@ def register_execution_tools(mcp: FastMCP):
                                          command=command, 
                                          original_error=str(e))
             return enhanced_error.to_dict()
+
+    @mcp.tool()
+    async def get_console_log(ctx: Context, max_bytes: int = 0, last_command: bool = False, instance: str = "") -> Dict[str, Any]:
+        r"""Return the FULL console transcript of a debugging session.
+
+        `run_command` returns the output of ONE command, capped so a large
+        command cannot bloat a JSON reply. This tool returns the accumulated
+        transcript instead: every command echoed with its debugger prompt
+        (`0: kd>`, `?: kd>`) followed by everything it printed, from the first
+        command of the session up to now.
+
+        Use it to capture a whole session for a report/post-mortem, or to read
+        back output that a capped reply cut off.
+
+        This tool is READ-ONLY by design: there is deliberately no way to clear
+        the log through MCP (no `.cls`/`.clear` equivalent). A transcript exists
+        to be evidence, and an accidental wipe -- by a script, a retry loop, or
+        another agent sharing the bridge -- destroys exactly the thing that was
+        wanted. The log simply accumulates (capped; oldest bytes dropped first)
+        and survives for the life of the WinDbgX session.
+
+        Args:
+            max_bytes: Hard cap on the returned text (0 = whole log). When the
+                cap is hit the TAIL is returned, because the most recent output
+                is what you usually want; a note marks the truncation.
+            last_command: Return only what the MOST RECENT command printed --
+                the uncapped form of its run_command reply. Useful when one
+                command was cut off but the whole session is not wanted.
+            instance: WinDbgX pipe name. Defaults to this client's pinned
+                session (see select_instance); REQUIRED when several sessions
+                are live and none is pinned.
+
+        Returns:
+            ``{"output": <transcript>, "bytes": <int>, "truncated": <bool>}``,
+            or an enhanced error dictionary.
+        """
+        _explicit = instance.strip() if instance and instance.strip() else None
+        if not _explicit:
+            try:
+                from core.communication import client_instance as _ci
+                _explicit = _ci(getattr(ctx, "client_id", None))
+            except Exception:
+                _explicit = None
+
+        # A multi-session bridge must never answer with another target's log:
+        # the transcript names the machine it came from, so a wrong pick is
+        # convincing rather than obviously broken. Refuse instead of guessing.
+        if not _explicit:
+            live = list_windbg_instances()
+            if len(live) == 1:
+                _explicit = live[0]
+            elif len(live) > 1:
+                return {
+                    "success": False,
+                    "error": "ambiguous session: %d live, none selected" % len(live),
+                    "instances": live,
+                    "hint": "pass instance= or call select_instance(pipe_name=...)",
+                }
+
+        from core.communication import send_handler_command as _shc
+
+        def _fetch():
+            return _shc("get_console_log",
+                        timeout_ms=30000,
+                        instance=_explicit,
+                        max_bytes=int(max_bytes or 0),
+                        last_command=bool(last_command))
+
+        import asyncio as _aio
+        try:
+            resp = await _aio.get_event_loop().run_in_executor(None, _fetch)
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "instance": _explicit,
+                "hint": ("An older extension DLL has no get_console_log handler. "
+                         "Rebuild/redeploy the extension so it exports it."),
+            }
+
+        if not isinstance(resp, dict):
+            return {"success": False, "error": "invalid handler response", "instance": _explicit}
+
+        out = resp.get("output", "") or ""
+        return {
+            "success": resp.get("status") != "error",
+            "instance": _explicit,
+            "output": out,
+            "bytes": len(out),
+            "truncated": bool(resp.get("truncated", False)),
+            "last_command": bool(last_command),
+        }
 
     @mcp.tool()
     async def run_sequence(ctx: Context, commands: List[str], stop_on_error: bool = False) -> Dict[str, Any]:

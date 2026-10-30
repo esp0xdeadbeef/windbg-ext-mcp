@@ -14,6 +14,7 @@ void BasicCommandHandlers::RegisterHandlers(MCPServer& server) {
     server.RegisterHandler("lm", ListModulesHandler);
     server.RegisterHandler("dt", DisplayTypeHandler);
     server.RegisterHandler("dd", DisplayMemoryHandler);
+    server.RegisterHandler("get_console_log", GetConsoleLogHandler);   // full transcript
 }
 
 json BasicCommandHandlers::CheckConnectionHandler(const json& message) {
@@ -235,4 +236,56 @@ json BasicCommandHandlers::InterruptHandler(const json& message) {
     resp["broke"] = broke;
     resp["was_running"] = (before != DEBUG_STATUS_BREAK);
     return resp;
+}
+json BasicCommandHandlers::GetConsoleLogHandler(const json& message) {
+    // Return the ACCUMULATED console transcript -- every command echoed with its
+    // prompt plus all of its output -- rather than the single-command reply the
+    // `execute_command` path produces.
+    //
+    // This exists because run_command is deliberately capped (MAX_OUTPUT_SIZE)
+    // and scoped to one command: after a long session the transcript is exactly
+    // what is wanted for a report or a post-mortem, and it cannot be
+    // reconstructed from a series of per-command replies once any of them was
+    // truncated.
+    //
+    // READ-ONLY BY DESIGN: there is no clear/reset argument and no wipe path.
+    // A transcript is evidence; an accidental clear (a script, a retry loop,
+    // another agent sharing the pipe) destroys precisely what was wanted, and
+    // nothing here needs one -- the log caps itself and trims its oldest bytes.
+    const int id = message.value("id", 0);
+    try {
+        auto args = message.value("args", json::object());
+        // last_command: return just the most recent command's transcript, which
+        // is the UNCAPPED form of the run_command reply (see GetLastCommandLog).
+        const bool lastOnly = args.value("last_command", false);
+        // 0 / negative => use the callback's own (larger) cap.
+        size_t maxBytes = 0;
+        if (args.contains("max_bytes") && args["max_bytes"].is_number_integer()) {
+            const long long v = args["max_bytes"].get<long long>();
+            if (v > 0) maxBytes = static_cast<size_t>(v);
+        }
+
+        // The callback belongs to the process-wide client; reuse it, do NOT
+        // create a second one (that kills the session -- see InterruptHandler).
+        CComPtr<IDebugClient> client;
+        CComPtr<OutputCallbacks> cbs;
+        HRESULT hr = CommandUtilities::GetOrCreateClient(&client, &cbs);
+        if (FAILED(hr) || !cbs)
+            return CommandUtilities::CreateErrorResponse(
+                id, "get_console_log", "GetOrCreateClient failed");
+
+        bool truncated = false;
+        std::string log = lastOnly ? cbs->GetLastCommandLog(maxBytes, &truncated)
+                                  : cbs->GetConsoleLog(maxBytes, &truncated);
+
+        json resp = CommandUtilities::CreateSuccessResponse(id, "get_console_log", log);
+        resp["bytes"] = log.size();
+        resp["truncated"] = truncated;
+        resp["last_command"] = lastOnly;
+        return resp;
+    }
+    catch (const std::exception& e) {
+        return CommandUtilities::CreateErrorResponse(
+            id, "get_console_log", std::string("Failed to read console log: ") + e.what());
+    }
 }

@@ -1064,19 +1064,24 @@ async def send_command_async(command: str, timeout_ms: int = DEFAULT_TIMEOUT_MS,
     )
 
 
-def send_handler_command(handler_name: str, timeout_ms: int = DEFAULT_TIMEOUT_MS, **kwargs) -> Dict[str, Any]:
+def send_handler_command(handler_name: str, timeout_ms: int = DEFAULT_TIMEOUT_MS,
+                         instance: Optional[str] = None, **kwargs) -> Dict[str, Any]:
     """
     Send a direct handler command to the WinDbg extension.
     
     Args:
         handler_name: Name of the handler
         timeout_ms: Timeout in milliseconds
+        instance: Optional WinDbgX pipe name; defaults to the selected instance.
+            Without it a multi-session bridge answers from whichever session is
+            the process-wide default, which is the wrong target as soon as two
+            agents share the bridge.
         **kwargs: Additional arguments
         
     Returns:
         The handler response as a dictionary
     """
-    manager = _get_communication_manager()
+    manager = _get_communication_manager(instance)
     return manager.send_handler_command(handler_name, timeout_ms, **kwargs)
 
 

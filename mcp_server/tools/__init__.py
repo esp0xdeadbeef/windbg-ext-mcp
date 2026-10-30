@@ -73,7 +73,7 @@ TOOL_CATEGORIES = {
         "description": "Tools for managing debugging sessions, connections, and session recovery"
     },
     "command_execution": {
-        "tools": ["run_command", "run_sequence", "breakpoint_and_continue"],
+        "tools": ["run_command", "run_sequence", "breakpoint_and_continue", "get_console_log"],
         "description": "Tools for executing WinDbg commands with validation and error handling"
     },
     "analysis": {
